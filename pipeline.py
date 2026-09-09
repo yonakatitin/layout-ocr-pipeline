@@ -131,10 +131,128 @@ def filter_outliers(words, max_height_ratio=3.2, short_symbol_max_h=260):
         cleaned.append(w)
     return cleaned
 
+import numpy as np
+
+
+def cluster_lines(words, col_gap_factor=5.0, col_gap_ratio=2.8):
+    ws = sorted(words, key=lambda w: (w["top"], w["left"]))
+    rows = []
+    for w in ws:
+        wc = w["top"] + w["height"] / 2.0
+        best = None
+        for row in rows:
+            tol = row["avg_h"] * 0.40
+            if abs(wc - row["center"]) < tol:
+                best = row
+                break
+        if best is None:
+            rows.append({"center": wc, "avg_h": w["height"], "words": [w]})
+        else:
+            k = len(best["words"])
+            best["center"] = (best["center"] * k + wc) / (k + 1)
+            best["avg_h"] = (best["avg_h"] * k + w["height"]) / (k + 1)
+            best["words"].append(w)
+
+    lines = []
+    for row in rows:
+        row_words = sorted(row["words"], key=lambda w: w["left"])
+        avg_h = float(np.median([w["height"] for w in row_words]))
+
+        if len(row_words) > 1:
+            gaps = [w["left"] - (pw["left"] + pw["width"])
+                    for pw, w in zip(row_words, row_words[1:])]
+            median_gap = float(np.median(gaps)) if gaps else 0.0
+        else:
+            median_gap = 0.0
+
+        cur = [row_words[0]]
+        for prev_w, w in zip(row_words, row_words[1:]):
+            gap = w["left"] - (prev_w["left"] + prev_w["width"])
+            # batas kolom = gap jauh lebih besar dari gap normal ANTAR KATA
+            # di baris ini sendiri (bukan cuma dibanding tinggi teks)
+            is_col_break = gap > avg_h * col_gap_factor or (
+                median_gap > 0 and gap > median_gap * col_gap_ratio and gap > avg_h * 1.5
+            )
+            if is_col_break:
+                lines.append(cur)
+                cur = [w]
+            else:
+                cur.append(w)
+        lines.append(cur)
+
+    line_objs = []
+    for lw in lines:
+        top = min(w["top"] for w in lw)
+        bottom = max(w["top"] + w["height"] for w in lw)
+        line_objs.append({"top": top, "bottom": bottom, "words": sorted(lw, key=lambda w: w["left"])})
+    line_objs.sort(key=lambda l: (l["top"], min(w["left"] for w in l["words"])))
+    return line_objs
+
+
+def cluster_paragraphs(lines, gap_factor=0.7, min_x_overlap=0.35, max_height_ratio=1.7):
+    """
+    Gabungkan baris jadi paragraf pakai union-find (bukan cuma cek baris
+    yang bersebelahan di list, karena urutan list bisa interleaved antar
+    kolom). Syarat gabung: jarak vertikal kecil + overlap horizontal +
+    ukuran font mirip (biar judul besar ga ke-gabung sama body text kecil).
+    """
+    if not lines:
+        return []
+
+    def line_bounds(line):
+        l = min(w["left"] for w in line["words"])
+        r = max(w["left"] + w["width"] for w in line["words"])
+        return l, r
+
+    n = len(lines)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[ry] = rx
+
+    bounds = [line_bounds(l) for l in lines]
+    for i in range(n):
+        for j in range(i + 1, n):
+            li, lj = lines[i], lines[j]
+            h_i, h_j = li["bottom"] - li["top"], lj["bottom"] - lj["top"]
+            avg_h = (h_i + h_j) / 2.0
+            gap = (lj["top"] - li["bottom"]) if li["top"] <= lj["top"] else (li["top"] - lj["bottom"])
+
+            l_i, r_i = bounds[i]
+            l_j, r_j = bounds[j]
+            overlap = max(0, min(r_i, r_j) - max(l_i, l_j))
+            min_w = min(r_i - l_i, r_j - l_j) or 1
+            x_overlap_ratio = overlap / min_w
+
+            height_ratio = max(h_i, h_j) / max(min(h_i, h_j), 1)
+
+            if gap < avg_h * gap_factor and x_overlap_ratio > min_x_overlap and height_ratio < max_height_ratio:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(lines[i])
+    paragraphs = list(groups.values())
+    for p in paragraphs:
+        p.sort(key=lambda l: l["top"])
+    paragraphs.sort(key=lambda p: (p[0]["top"], min(w["left"] for w in p[0]["words"])))
+    return paragraphs
+
 if __name__ == "__main__":
     for n in range(1, 6):
         img = cv2.imread(f"images/slide{n}.jpg")
         words = ocr_words_tiled(img)
-        print(f"\n=== slide{n}.jpg -> {len(words)} kata terdeteksi ===")
-        for w in sorted(words, key=lambda w: w["top"]):
-            print(f"  {w['text']!r:20} conf={w['conf']:.0f} left={w['left']} top={w['top']}")
+        lines = cluster_lines(words)
+        paragraphs = cluster_paragraphs(lines)
+        print(f"\n=== slide{n}.jpg -> {len(words)} kata, {len(lines)} baris, {len(paragraphs)} paragraf ===")
+        for p in paragraphs:
+            teks = " / ".join(" ".join(w["text"] for w in line["words"]) for line in p)
+            print(f"  [{len(p)} baris] {teks}")
