@@ -83,12 +83,58 @@ def ocr_words_tiled(image_bgr, lang=TESS_LANG, min_conf=45, target_tile_px=3200,
                 "width": ww,
                 "height": wh,
             })
-    return dedup_words(all_words)
+    words = dedup_words(all_words)
+    words = [w for w in words if looks_like_real_word(w["text"], w["conf"])]
+    words = filter_outliers(words)
+    return words
+
+def looks_like_real_word(text, conf, min_high_conf=85, min_low_conf=60):
+    """
+    Filter buat buang noise OCR (biasanya dari ikon/ilustrasi yang
+    kebaca sebagai simbol/huruf random).
+    - Confidence tinggi (>=85) + minimal 1 huruf/angka -> dipercaya.
+    - Confidence sedang (>=60) -> harus terlihat kayak kata beneran
+      (minimal 4 karakter alfanumerik, bukan simbol doang).
+    """
+    t = text.strip()
+    if not t:
+        return False
+    alnum = sum(ch.isalnum() for ch in t)  # huruf DAN angka dihitung
+    if conf >= min_high_conf and alnum >= 1:
+        return True
+    if conf >= min_low_conf and alnum >= 4 and alnum / len(t) > 0.6:
+        return True
+    return False
+
+
+def filter_outliers(words, max_height_ratio=3.2, short_symbol_max_h=260):
+    """
+    Buang deteksi yang jelas aneh:
+    - token pendek (<=2 char) tanpa huruf/angka tapi bounding box-nya
+      raksasa (biasanya salah baca elemen grafis/ikon)
+    - token pendek yang tinggi bounding box-nya jauh di atas rata-rata
+      tinggi teks lain di gambar (outlier ukuran)
+    """
+    if not words:
+        return words
+    heights = sorted(w["height"] for w in words)
+    median_h = heights[len(heights) // 2]
+
+    cleaned = []
+    for w in words:
+        text = w["text"].strip()
+        has_alnum = any(c.isalnum() for c in text)
+        if not has_alnum and len(text) <= 2 and w["height"] > short_symbol_max_h:
+            continue
+        if median_h > 0 and w["height"] > median_h * max_height_ratio and len(text) <= 3:
+            continue
+        cleaned.append(w)
+    return cleaned
 
 if __name__ == "__main__":
     for n in range(1, 6):
         img = cv2.imread(f"images/slide{n}.jpg")
         words = ocr_words_tiled(img)
         print(f"\n=== slide{n}.jpg -> {len(words)} kata terdeteksi ===")
-        for w in sorted(words, key=lambda w: w["top"])[:8]:  # tampilin 8 aja biar ga kepanjangan
+        for w in sorted(words, key=lambda w: w["top"]):
             print(f"  {w['text']!r:20} conf={w['conf']:.0f} left={w['left']} top={w['top']}")
