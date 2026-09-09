@@ -32,23 +32,63 @@ def make_tiles(img_w, img_h, target_tile_px=3200, overlap=0.25):
             tiles.append((x, y, x1, y1))
     return tiles
 
+def iou(a, b):
+    ax0, ay0, ax1, ay1 = a["left"], a["top"], a["left"] + a["width"], a["top"] + a["height"]
+    bx0, by0, bx1, by1 = b["left"], b["top"], b["left"] + b["width"], b["top"] + b["height"]
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    inter = (ix1 - ix0) * (iy1 - iy0)
+    area_a = (ax1 - ax0) * (ay1 - ay0)
+    area_b = (bx1 - bx0) * (by1 - by0)
+    return inter / (area_a + area_b - inter + 1e-6)
+
+
+def dedup_words(words, iou_thresh=0.4):
+    """Buang deteksi duplikat akibat overlap antar tile.
+    Diurutkan by confidence tinggi dulu -> panjang teks -> yang menang disimpan."""
+    words = sorted(words, key=lambda w: (-w["conf"], -len(w["text"])))
+    kept = []
+    for w in words:
+        if any(iou(w, k) > iou_thresh for k in kept):
+            continue
+        kept.append(w)
+    return kept
+
+
+def ocr_words_tiled(image_bgr, lang=TESS_LANG, min_conf=45, target_tile_px=3200, overlap=0.25):
+    """OCR seluruh gambar lewat tiling + dedup, hasilnya list of dict per kata."""
+    h, w = image_bgr.shape[:2]
+    tiles = make_tiles(w, h, target_tile_px=target_tile_px, overlap=overlap)
+
+    all_words = []
+    for (x0, y0, x1, y1) in tiles:
+        crop = image_bgr[y0:y1, x0:x1]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        data = pytesseract.image_to_data(gray, lang=lang, output_type=Output.DICT)
+        for i in range(len(data["text"])):
+            text = data["text"][i]
+            conf = float(data["conf"][i])
+            if not text.strip() or conf < min_conf:
+                continue
+            ww, wh = data["width"][i], data["height"][i]
+            if ww <= 0 or wh <= 0:
+                continue
+            all_words.append({
+                "text": text,
+                "conf": conf,
+                "left": x0 + data["left"][i],
+                "top": y0 + data["top"][i],
+                "width": ww,
+                "height": wh,
+            })
+    return dedup_words(all_words)
 
 if __name__ == "__main__":
-    img = cv2.imread("images/slide1.jpg")
-    h, w = img.shape[:2]
-    tiles = make_tiles(w, h)
-    print(f"Ukuran gambar: {w}x{h}")
-    print(f"Jumlah tile: {len(tiles)}")
-    for t in tiles:
-        print(t, "-> lebar:", t[2] - t[0], "tinggi:", t[3] - t[1])
-
-    print("\n--- OCR per tile, cari 'Profile Image Studio' ---")
-    for (x0, y0, x1, y1) in tiles:
-        crop = img[y0:y1, x0:x1]
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        data = pytesseract.image_to_data(gray, lang=TESS_LANG, output_type=Output.DICT)
-        for i in range(len(data["text"])):
-            text = data["text"][i].strip()
-            conf = float(data["conf"][i])
-            if text and conf > 45:
-                print(f"tile{(x0,y0,x1,y1)} -> {text!r:20} conf={conf:.0f} left={x0+data['left'][i]} top={y0+data['top'][i]}")
+    for n in range(1, 6):
+        img = cv2.imread(f"images/slide{n}.jpg")
+        words = ocr_words_tiled(img)
+        print(f"\n=== slide{n}.jpg -> {len(words)} kata terdeteksi ===")
+        for w in sorted(words, key=lambda w: w["top"])[:8]:  # tampilin 8 aja biar ga kepanjangan
+            print(f"  {w['text']!r:20} conf={w['conf']:.0f} left={w['left']} top={w['top']}")
