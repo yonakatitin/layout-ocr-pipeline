@@ -159,59 +159,61 @@ def filter_outliers(words, max_height_ratio=3.2, short_symbol_max_h=260):
 import numpy as np
 
 
-def cluster_lines(words, col_gap_factor=5.0, col_gap_ratio=2.8):
-    ws = sorted(words, key=lambda w: (w["top"], w["left"]))
-    rows = []
-    for w in ws:
-        wc = w["top"] + w["height"] / 2.0
-        best = None
-        for row in rows:
-            tol = row["avg_h"] * 0.40
-            if abs(wc - row["center"]) < tol:
-                best = row
-                break
-        if best is None:
-            rows.append({"center": wc, "avg_h": w["height"], "words": [w]})
-        else:
-            k = len(best["words"])
-            best["center"] = (best["center"] * k + wc) / (k + 1)
-            best["avg_h"] = (best["avg_h"] * k + w["height"]) / (k + 1)
-            best["words"].append(w)
+def cluster_lines(words, v_tol_factor=0.45, h_gap_factor=2.0):
+    """
+    Gabungkan kata jadi baris pakai union-find: 2 kata dianggap 1 baris
+    HANYA KALAU deket secara vertikal (center Y mirip) DAN deket secara
+    horizontal (gap kecil) sekaligus. Ini lebih robust dibanding pisah
+    row-dulu-baru-kolom, karena nggak ada 'drift' dari average yang
+    terus membesar.
+    """
+    n = len(words)
+    if n == 0:
+        return []
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[ry] = rx
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            wi, wj = words[i], words[j]
+            avg_h = (wi["height"] + wj["height"]) / 2.0
+            ci = wi["top"] + wi["height"] / 2.0
+            cj = wj["top"] + wj["height"] / 2.0
+            v_dist = abs(ci - cj)
+
+            i_right = wi["left"] + wi["width"]
+            j_right = wj["left"] + wj["width"]
+            if wi["left"] <= wj["left"]:
+                h_gap = max(0, wj["left"] - i_right)
+            else:
+                h_gap = max(0, wi["left"] - j_right)
+
+            if v_dist < avg_h * v_tol_factor and h_gap < avg_h * h_gap_factor:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(words[i])
 
     lines = []
-    for row in rows:
-        row_words = sorted(row["words"], key=lambda w: w["left"])
-        avg_h = float(np.median([w["height"] for w in row_words]))
+    for group in groups.values():
+        group.sort(key=lambda w: w["left"])
+        top = min(w["top"] for w in group)
+        bottom = max(w["top"] + w["height"] for w in group)
+        lines.append({"top": top, "bottom": bottom, "words": group})
 
-        if len(row_words) > 1:
-            gaps = [w["left"] - (pw["left"] + pw["width"])
-                    for pw, w in zip(row_words, row_words[1:])]
-            median_gap = float(np.median(gaps)) if gaps else 0.0
-        else:
-            median_gap = 0.0
-
-        cur = [row_words[0]]
-        for prev_w, w in zip(row_words, row_words[1:]):
-            gap = w["left"] - (prev_w["left"] + prev_w["width"])
-            # batas kolom = gap jauh lebih besar dari gap normal ANTAR KATA
-            # di baris ini sendiri (bukan cuma dibanding tinggi teks)
-            is_col_break = gap > avg_h * col_gap_factor or (
-                median_gap > 0 and gap > median_gap * col_gap_ratio and gap > avg_h * 1.5
-            )
-            if is_col_break:
-                lines.append(cur)
-                cur = [w]
-            else:
-                cur.append(w)
-        lines.append(cur)
-
-    line_objs = []
-    for lw in lines:
-        top = min(w["top"] for w in lw)
-        bottom = max(w["top"] + w["height"] for w in lw)
-        line_objs.append({"top": top, "bottom": bottom, "words": sorted(lw, key=lambda w: w["left"])})
-    line_objs.sort(key=lambda l: (l["top"], min(w["left"] for w in l["words"])))
-    return line_objs
+    lines.sort(key=lambda l: (l["top"], min(w["left"] for w in l["words"])))
+    return lines
 
 
 def cluster_paragraphs(lines, gap_factor=0.7, min_x_overlap=0.35, max_height_ratio=1.7):
