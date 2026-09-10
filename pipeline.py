@@ -9,7 +9,7 @@ TESS_LANG = "ind+eng"
 TESS_CONFIGS = ["--psm 3", "--psm 11"]
 
 
-def make_tiles(img_w, img_h, target_tile_px=3200, overlap=0.25):
+def make_tiles(img_w, img_h, target_tile_px=3200, overlap=0.35):
     """
     Bikin grid tile yang saling overlap.
     - target_tile_px: ukuran ideal 1 sisi tile (pixel)
@@ -80,7 +80,7 @@ def dedup_words(words, iou_thresh=0.4, containment_thresh=0.75):
             kept.append(w)
     return kept
 
-def ocr_words_tiled(image_bgr, lang=TESS_LANG, min_conf=45, target_tile_px=3200, overlap=0.25):
+def ocr_words_tiled(image_bgr, lang=TESS_LANG, min_conf=45, target_tile_px=3200, overlap=0.35):
     """OCR seluruh gambar lewat tiling (psm3 + psm11) + dedup + filter noise."""
     h, w = image_bgr.shape[:2]
     tiles = make_tiles(w, h, target_tile_px=target_tile_px, overlap=overlap)
