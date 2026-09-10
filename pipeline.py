@@ -117,15 +117,20 @@ def looks_like_real_word(text, conf, min_high_conf=85, min_low_conf=60):
     """
     Filter buat buang noise OCR (biasanya dari ikon/ilustrasi yang
     kebaca sebagai simbol/huruf random).
-    - Confidence tinggi (>=85) + minimal 1 huruf/angka -> dipercaya.
+    - Token pendek (<=2 karakter) sering salah baca ikon/garis grafis
+      dengan confidence lumayan tinggi (85-88) -> butuh threshold
+      lebih ketat (92) supaya nggak lolos, sementara kata pendek asli
+      ("PT", "di", "IT,") biasanya confidence-nya >=93.
+    - Token lebih panjang (>2 karakter) pakai threshold normal (85).
     - Confidence sedang (>=60) -> harus terlihat kayak kata beneran
       (minimal 4 karakter alfanumerik, bukan simbol doang).
     """
     t = text.strip()
     if not t:
         return False
-    alnum = sum(ch.isalnum() for ch in t)  # huruf DAN angka dihitung
-    if conf >= min_high_conf and alnum >= 1:
+    alnum = sum(ch.isalnum() for ch in t)
+    required_conf = min_high_conf if len(t) > 2 else 92
+    if conf >= required_conf and alnum >= 1:
         return True
     if conf >= min_low_conf and alnum >= 4 and alnum / len(t) > 0.6:
         return True
