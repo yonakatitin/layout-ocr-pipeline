@@ -278,13 +278,111 @@ def cluster_paragraphs(lines, gap_factor=0.7, min_x_overlap=0.35, max_height_rat
     paragraphs.sort(key=lambda p: (p[0]["top"], min(w["left"] for w in p[0]["words"])))
     return paragraphs
 
+def glyph_mask_for_box(gray, left, top, w, h, pad=3):
+    """
+    Ambil crop di sekitar 1 kata (+ sedikit padding), lalu pisahkan
+    pixel 'teks' dari 'background' pakai Otsu threshold.
+    Asumsi: pixel teks itu MINORITAS di dalam box (background lebih
+    dominan), jadi kalau hasil threshold malah mayoritas putih,
+    kita balik (invert).
+    """
+    H, W = gray.shape[:2]
+    x0 = max(0, left - pad)
+    y0 = max(0, top - pad)
+    x1 = min(W, left + w + pad)
+    y1 = min(H, top + h + pad)
+    crop = gray[y0:y1, x0:x1]
+    if crop.size == 0:
+        return None, x0, y0
+    _, th = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    white_ratio = np.count_nonzero(th) / th.size
+    if white_ratio > 0.5:
+        th = cv2.bitwise_not(th)
+    return th, x0, y0
+
+
+def estimate_word_color_and_mask(image_bgr, gray, word):
+    """Kembalikan (warna_bgr, mask_full_size) untuk 1 kata."""
+    H, W = gray.shape[:2]
+    mask, x0, y0 = glyph_mask_for_box(gray, word["left"], word["top"], word["width"], word["height"])
+    full_mask = np.zeros((H, W), dtype=np.uint8)
+    color = (30, 30, 30)  # default abu gelap kalau gagal
+    if mask is not None and mask.any():
+        full_mask[y0:y0 + mask.shape[0], x0:x0 + mask.shape[1]] = mask
+        ys, xs = np.where(mask > 0)
+        pixels = image_bgr[y0:y0 + mask.shape[0], x0:x0 + mask.shape[1]][ys, xs]
+        if len(pixels):
+            color = tuple(int(c) for c in np.median(pixels, axis=0))
+    return color, full_mask
+
+
+def bgr_to_hex(bgr):
+    b, g, r = bgr
+    return "#{:02x}{:02x}{:02x}".format(int(r), int(g), int(b))
+
+
+def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
+    """
+    Hitung bounding box gabungan + style (warna, ukuran font, dst)
+    untuk 1 paragraf (list of lines), sekaligus kumpulin glyph mask-nya
+    (nanti dipakai buat inpainting di langkah berikutnya).
+    """
+    line_texts = []
+    all_colors, all_heights = [], []
+    glyph_areas, box_areas = [], []
+    combined_mask = np.zeros(gray.shape[:2], dtype=np.uint8)
+
+    for line in para_lines:
+        words = line["words"]
+        line_texts.append(" ".join(w["text"] for w in words))
+        for w in words:
+            color, mask = estimate_word_color_and_mask(image_bgr, gray, w)
+            all_colors.append(color)
+            all_heights.append(w["height"])
+            glyph_areas.append(int(mask.sum() / 255))
+            box_areas.append(w["width"] * w["height"])
+            combined_mask = cv2.bitwise_or(combined_mask, mask)
+
+    all_words = [w for line in para_lines for w in line["words"]]
+    left = min(w["left"] for w in all_words)
+    top = min(w["top"] for w in all_words)
+    right = max(w["left"] + w["width"] for w in all_words)
+    bottom = max(w["top"] + w["height"] for w in all_words)
+
+    median_h = float(np.median(all_heights)) if all_heights else 20.0
+    font_size_px = median_h / 0.70  # perkiraan cap-height -> font-size CSS
+
+    if len(para_lines) > 1:
+        tops = [line["top"] for line in para_lines]
+        gaps = [b - a for a, b in zip(tops, tops[1:])]
+        line_height_px = float(np.median(gaps))
+    else:
+        line_height_px = font_size_px * 1.25
+
+    color_bgr = tuple(int(c) for c in np.median(np.array(all_colors), axis=0)) if all_colors else (30, 30, 30)
+
+    stroke_density = (sum(glyph_areas) / sum(box_areas)) if box_areas else 0.18
+    font_weight = 700 if stroke_density > 0.30 else 400
+
+    record = {
+        "text": "\n".join(line_texts),
+        "left": left, "top": top,
+        "width": right - left, "height": bottom - top,
+        "font_size_px": round(font_size_px, 1),
+        "line_height_px": round(line_height_px, 1),
+        "color": bgr_to_hex(color_bgr),
+        "font_weight": font_weight,
+    }
+    return record, combined_mask
+
 if __name__ == "__main__":
-    for n in range(1, 6):
-        img = cv2.imread(f"images/slide{n}.jpg")
-        words = ocr_words_tiled(img)
-        lines = cluster_lines(words)
-        paragraphs = cluster_paragraphs(lines)
-        print(f"\n=== slide{n}.jpg -> {len(words)} kata, {len(lines)} baris, {len(paragraphs)} paragraf ===")
-        for p in paragraphs:
-            teks = " / ".join(" ".join(w["text"] for w in line["words"]) for line in p)
-            print(f"  [{len(p)} baris] {teks}")
+    img = cv2.imread("images/slide3.jpg")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    words = ocr_words_tiled(img)
+    lines = cluster_lines(words)
+    paragraphs = cluster_paragraphs(lines)
+
+    img_h, img_w = img.shape[:2]
+    for p in paragraphs:
+        record, mask = build_paragraph_record(img, gray, p, img_w, img_h)
+        print(f"text={record['text'][:40]!r:42} color={record['color']} font_size={record['font_size_px']} weight={record['font_weight']}")
