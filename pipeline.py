@@ -45,16 +45,39 @@ def iou(a, b):
     area_b = (bx1 - bx0) * (by1 - by0)
     return inter / (area_a + area_b - inter + 1e-6)
 
+def contained_ratio(a, b):
+    """Seberapa besar persentase box a yang 'ketelan' di dalam box b (0..1)."""
+    ax0, ay0, ax1, ay1 = a["left"], a["top"], a["left"] + a["width"], a["top"] + a["height"]
+    bx0, by0, bx1, by1 = b["left"], b["top"], b["left"] + b["width"], b["top"] + b["height"]
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    inter = (ix1 - ix0) * (iy1 - iy0)
+    area_a = (ax1 - ax0) * (ay1 - ay0) or 1
+    return inter / area_a
 
-def dedup_words(words, iou_thresh=0.4):
-    """Buang deteksi duplikat akibat overlap antar tile.
-    Diurutkan by confidence tinggi dulu -> panjang teks -> yang menang disimpan."""
+def dedup_words(words, iou_thresh=0.4, containment_thresh=0.75):
+    """
+    Buang duplikat 2 cara:
+    1. IoU tinggi -> box yang hampir sama persis (dari tile overlap)
+    2. Containment tinggi -> box kecil yang 'ketelan' di dalam box lain
+       yang lebih besar (fragmen/pecahan kata salah baca, biasanya
+       muncul dari psm11 yang lebih 'berani' nebak-nebak)
+    """
     words = sorted(words, key=lambda w: (-w["conf"], -len(w["text"])))
     kept = []
     for w in words:
-        if any(iou(w, k) > iou_thresh for k in kept):
-            continue
-        kept.append(w)
+        is_dup = False
+        for k in kept:
+            if iou(w, k) > iou_thresh:
+                is_dup = True
+                break
+            if contained_ratio(w, k) > containment_thresh and w["width"] * w["height"] <= k["width"] * k["height"]:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(w)
     return kept
 
 def ocr_words_tiled(image_bgr, lang=TESS_LANG, min_conf=45, target_tile_px=3200, overlap=0.25):
