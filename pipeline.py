@@ -375,7 +375,7 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     }
     return record, combined_mask
 
-def inpaint_background(image_bgr, full_text_mask, dilate=3, radius=6):
+def inpaint_background(image_bgr, full_text_mask, dilate=15, radius=20):
     """Hapus area teks (dari mask) di background pakai inpainting."""
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate * 2 + 1, dilate * 2 + 1))
     mask = cv2.dilate(full_text_mask, kernel, iterations=1)
@@ -394,14 +394,6 @@ if __name__ == "__main__":
         record, mask = build_paragraph_record(img, gray, p, img_w, img_h)
         full_mask = cv2.bitwise_or(full_mask, mask)
 
-    variants = [
-        ("dilate3_r6", 3, 6),
-        ("dilate8_r10", 8, 10),
-        ("dilate12_r15", 12, 15),
-        ("dilate15_r20", 15, 20),
-    ]
-    for name, dilate, radius in variants:
-        clean = inpaint_background(img, full_mask, dilate=dilate, radius=radius)
-        crop = clean[200:1250, 200:2200]  # crop area card "Talent Development" biar gampang diliat
-        cv2.imwrite(f"debug_inpaint_{name}.jpg", crop)
-        print(f"saved debug_inpaint_{name}.jpg")
+    clean = inpaint_background(img, full_mask)
+    cv2.imwrite("debug_final_inpaint_slide3.jpg", clean)
+    print("Selesai, cek debug_final_inpaint_slide3.jpg")
