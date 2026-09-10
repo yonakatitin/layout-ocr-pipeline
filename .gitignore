@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 images/
 output/
+debug_*.jpg
+debug_*.png
