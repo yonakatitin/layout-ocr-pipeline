@@ -388,7 +388,7 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     bottom = max(w["top"] + w["height"] for w in all_words)
 
     median_h = float(np.median(all_heights)) if all_heights else 20.0
-    font_size_px = median_h / 0.70  # perkiraan cap-height -> font-size CSS
+    font_size_px = median_h * 0.92  # dikit di bawah tinggi bbox asli, biar muat
 
     if len(para_lines) > 1:
         tops = [line["top"] for line in para_lines]
@@ -402,10 +402,13 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     stroke_density = (sum(glyph_areas) / sum(box_areas)) if box_areas else 0.18
     font_weight = 700 if stroke_density > 0.30 else 400
 
+    pad_x = (right - left) * 0.06
+    pad_y = (bottom - top) * 0.15
+
     record = {
         "text": "\n".join(line_texts),
-        "left": left, "top": top,
-        "width": right - left, "height": bottom - top,
+        "left": left - pad_x, "top": top - pad_y,
+        "width": (right - left) + pad_x * 2, "height": (bottom - top) + pad_y * 2,
         "font_size_px": round(font_size_px, 1),
         "line_height_px": round(line_height_px, 1),
         "color": bgr_to_hex(color_bgr),
