@@ -375,6 +375,12 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     }
     return record, combined_mask
 
+def inpaint_background(image_bgr, full_text_mask, dilate=3, radius=6):
+    """Hapus area teks (dari mask) di background pakai inpainting."""
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate * 2 + 1, dilate * 2 + 1))
+    mask = cv2.dilate(full_text_mask, kernel, iterations=1)
+    return cv2.inpaint(image_bgr, mask, radius, cv2.INPAINT_TELEA)
+
 if __name__ == "__main__":
     img = cv2.imread("images/slide3.jpg")
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -383,6 +389,11 @@ if __name__ == "__main__":
     paragraphs = cluster_paragraphs(lines)
 
     img_h, img_w = img.shape[:2]
+    full_mask = np.zeros((img_h, img_w), dtype=np.uint8)
     for p in paragraphs:
         record, mask = build_paragraph_record(img, gray, p, img_w, img_h)
-        print(f"text={record['text'][:40]!r:42} color={record['color']} font_size={record['font_size_px']} weight={record['font_weight']}")
+        full_mask = cv2.bitwise_or(full_mask, mask)
+
+    clean = inpaint_background(img, full_mask)
+    cv2.imwrite("debug_inpaint_result.jpg", clean)
+    print("Selesai, cek file debug_inpaint_result.jpg")
