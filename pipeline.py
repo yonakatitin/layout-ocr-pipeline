@@ -278,6 +278,21 @@ def cluster_paragraphs(lines, gap_factor=0.7, min_x_overlap=0.35, max_height_rat
     paragraphs.sort(key=lambda p: (p[0]["top"], min(w["left"] for w in p[0]["words"])))
     return paragraphs
 
+def is_likely_logo(para_lines, max_word_count=1, max_chars=4):
+    """
+    Deteksi paragraf yang kemungkinan besar logo/watermark, bukan
+    konten yang perlu diedit: 1 baris, 1 kata pendek (<=4 karakter).
+    Paragraf seperti ini kita biarin di background asli (nggak
+    di-inpaint, nggak dijadikan elemen teks HTML).
+    """
+    if len(para_lines) > 1:
+        return False
+    words = para_lines[0]["words"]
+    if len(words) > max_word_count:
+        return False
+    text = " ".join(w["text"] for w in words).strip()
+    return len(text) <= max_chars
+
 def glyph_mask_for_box(gray, left, top, w, h, pad=3):
     """
     Ambil crop di sekitar 1 kata (+ sedikit padding), lalu pisahkan
@@ -387,6 +402,7 @@ if __name__ == "__main__":
     words = ocr_words_tiled(img)
     lines = cluster_lines(words)
     paragraphs = cluster_paragraphs(lines)
+    paragraphs = [p for p in paragraphs if not is_likely_logo(p)]
 
     img_h, img_w = img.shape[:2]
     full_mask = np.zeros((img_h, img_w), dtype=np.uint8)
