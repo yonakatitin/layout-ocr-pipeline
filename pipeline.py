@@ -2,12 +2,24 @@ import math
 import cv2
 import pytesseract
 from pytesseract import Output
+import os
+import html as htmllib
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# ============================================================
+# LAYOUT-AWARE TEXT EXTRACTION PIPELINE
+# End-to-end: OCR -> clustering -> style detection -> inpainting -> HTML
+# ============================================================
 
 TESS_LANG = "ind+eng"
 TESS_CONFIGS = ["--psm 3", "--psm 11"]
 
+# ============================================================
+# 1. TILED OCR EXTRACTION
+# Potong gambar jadi tile overlap, OCR tiap tile (psm3+psm11),
+# gabung + dedup + filter noise.
+# ============================================================
 
 def make_tiles(img_w, img_h, target_tile_px=3200, overlap=0.35):
     """
@@ -163,6 +175,11 @@ def filter_outliers(words, max_height_ratio=3.2, short_symbol_max_h=260):
 
 import numpy as np
 
+# ============================================================
+# 2. LAYOUT CLUSTERING
+# Kata -> baris -> paragraf, pakai union-find biar robust untuk
+# layout multi-kolom (card bersebelahan, hexagon, dll).
+# ============================================================
 
 def cluster_lines(words, v_tol_factor=0.45, h_gap_factor=2.0):
     """
@@ -293,6 +310,12 @@ def is_likely_logo(para_lines, max_word_count=1, max_chars=4):
     text = " ".join(w["text"] for w in words).strip()
     return len(text) <= max_chars
 
+# ============================================================
+# 3. STYLE ESTIMATION
+# Pisahkan pixel teks dari background (Otsu), ambil warna dominan
+# + estimasi ukuran font per paragraf.
+# ============================================================
+
 def glyph_mask_for_box(gray, left, top, w, h, pad=3):
     """
     Ambil crop di sekitar 1 kata (+ sedikit padding), lalu pisahkan
@@ -390,26 +413,161 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     }
     return record, combined_mask
 
+# ============================================================
+# 4. INPAINTING
+# Hapus teks asli dari background biar HTML overlay nggak dobel.
+# ============================================================
+
 def inpaint_background(image_bgr, full_text_mask, dilate=15, radius=20):
     """Hapus area teks (dari mask) di background pakai inpainting."""
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate * 2 + 1, dilate * 2 + 1))
     mask = cv2.dilate(full_text_mask, kernel, iterations=1)
     return cv2.inpaint(image_bgr, mask, radius, cv2.INPAINT_TELEA)
 
+# ============================================================
+# 5. HTML GENERATION
+# Render paragraf jadi <div> contenteditable, posisi absolute,
+# di atas background hasil inpainting.
+# ============================================================
+
+STAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<title>{title}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  html, body {{
+    margin: 0; padding: 0; background: #e9edf1;
+    font-family: 'Segoe UI', Arial, Helvetica, sans-serif;
+  }}
+  .slide-viewport {{
+    position: relative;
+    width: 100%;
+    max-width: {img_w}px;
+    margin: 0 auto;
+    aspect-ratio: {img_w} / {img_h};
+    overflow: hidden;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.18);
+  }}
+  .slide-stage {{
+    position: absolute;
+    top: 0; left: 0;
+    width: {img_w}px;
+    height: {img_h}px;
+    transform-origin: top left;
+    background: #ffffff;
+  }}
+  .slide-stage img.bg-layer {{
+    position: absolute;
+    top: 0; left: 0;
+    width: {img_w}px;
+    height: {img_h}px;
+    display: block;
+    user-select: none;
+    pointer-events: none;
+  }}
+  .text-el {{
+    position: absolute;
+    box-sizing: border-box;
+    overflow: hidden;
+    white-space: pre-wrap;
+    outline: none;
+    cursor: text;
+    padding: 0 2px;
+  }}
+  .text-el:hover {{
+    outline: 1.5px dashed rgba(37, 99, 235, 0.55);
+    outline-offset: 2px;
+  }}
+  .text-el:focus {{
+    outline: 1.5px solid #2563eb;
+    outline-offset: 2px;
+    background: rgba(255,255,255,0.35);
+  }}
+</style>
+</head>
+<body>
+<div class="slide-viewport" id="viewport">
+  <div class="slide-stage" id="stage">
+    <img class="bg-layer" src="{bg_src}" alt="background">
+    {text_nodes}
+  </div>
+</div>
+<script>
+  const viewport = document.getElementById('viewport');
+  const stage = document.getElementById('stage');
+  const STAGE_W = {img_w};
+  function rescale() {{
+    const scale = viewport.clientWidth / STAGE_W;
+    stage.style.transform = `scale(${{scale}})`;
+  }}
+  window.addEventListener('resize', rescale);
+  window.addEventListener('load', rescale);
+  new ResizeObserver(rescale).observe(viewport);
+  rescale();
+</script>
+</body>
+</html>
+"""
+
+TEXT_NODE_TEMPLATE = (
+    '<div class="text-el" contenteditable="true" spellcheck="false" '
+    'style="left:{left}px; top:{top}px; width:{width}px; height:{height}px; '
+    'font-size:{font_size}px; line-height:{line_height}px; color:{color}; '
+    'font-weight:{font_weight};">{text}</div>'
+)
+
+
+def render_html(img_w, img_h, bg_src, paragraphs, title="Slide"):
+    """Susun semua paragraf jadi <div> yang diposisikan absolute, lalu
+    bungkus dalam template stage yang responsive (auto-scale via JS)."""
+    nodes = []
+    for p in paragraphs:
+        text = htmllib.escape(p["text"]).replace("\n", "<br>")
+        nodes.append(
+            TEXT_NODE_TEMPLATE.format(
+                left=p["left"], top=p["top"], width=p["width"], height=p["height"],
+                font_size=p["font_size_px"], line_height=p["line_height_px"],
+                color=p["color"], font_weight=p["font_weight"], text=text,
+            )
+        )
+    return STAGE_TEMPLATE.format(
+        title=htmllib.escape(title), img_w=img_w, img_h=img_h,
+        bg_src=bg_src, text_nodes="\n    ".join(nodes),
+    )
+
+# ============================================================
+# 6. DRIVER
+# ============================================================
+
 if __name__ == "__main__":
-    img = cv2.imread("images/slide3.jpg")
+    os.makedirs("output", exist_ok=True)
+
+    name = "slide3"
+    img = cv2.imread(f"images/{name}.jpg")
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    img_h, img_w = img.shape[:2]
+
     words = ocr_words_tiled(img)
     lines = cluster_lines(words)
     paragraphs = cluster_paragraphs(lines)
     paragraphs = [p for p in paragraphs if not is_likely_logo(p)]
 
-    img_h, img_w = img.shape[:2]
+    records = []
     full_mask = np.zeros((img_h, img_w), dtype=np.uint8)
     for p in paragraphs:
         record, mask = build_paragraph_record(img, gray, p, img_w, img_h)
+        records.append(record)
         full_mask = cv2.bitwise_or(full_mask, mask)
 
-    clean = inpaint_background(img, full_mask)
-    cv2.imwrite("debug_final_inpaint_slide3.jpg", clean)
-    print("Selesai, cek debug_final_inpaint_slide3.jpg")
+    clean_bg = inpaint_background(img, full_mask)
+    bg_path = f"output/{name}_bg.jpg"
+    cv2.imwrite(bg_path, clean_bg, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+
+    html_str = render_html(img_w, img_h, f"{name}_bg.jpg", records, title=name)
+    html_path = f"output/{name}.html"
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html_str)
+
+    print(f"Selesai! Buka {html_path} di browser.")
