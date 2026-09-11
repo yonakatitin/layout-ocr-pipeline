@@ -93,32 +93,42 @@ def dedup_words(words, iou_thresh=0.4, containment_thresh=0.75):
     return kept
 
 def ocr_words_tiled(image_bgr, lang=TESS_LANG, min_conf=45, target_tile_px=3200, overlap=0.35):
-    """OCR seluruh gambar lewat tiling (psm3 + psm11) + dedup + filter noise."""
+    """
+    OCR seluruh gambar lewat tiling (psm3 + psm11) + dedup + filter noise.
+    Pakai 2 ukuran grid tile berbeda (default + lebih kecil/granular)
+    supaya area yang gagal terdeteksi di grid besar (karena tile-nya
+    terlalu 'rame' buat Tesseract) masih punya kesempatan ketangkep
+    lewat grid yang lebih kecil.
+    """
     h, w = image_bgr.shape[:2]
-    tiles = make_tiles(w, h, target_tile_px=target_tile_px, overlap=overlap)
+    tile_sets = [
+        make_tiles(w, h, target_tile_px=target_tile_px, overlap=overlap),
+        make_tiles(w, h, target_tile_px=int(target_tile_px * 0.55), overlap=overlap),
+    ]
 
     all_words = []
-    for (x0, y0, x1, y1) in tiles:
-        crop = image_bgr[y0:y1, x0:x1]
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        for config in TESS_CONFIGS:
-            data = pytesseract.image_to_data(gray, lang=lang, config=config, output_type=Output.DICT)
-            for i in range(len(data["text"])):
-                text = data["text"][i]
-                conf = float(data["conf"][i])
-                if not text.strip() or conf < min_conf:
-                    continue
-                ww, wh = data["width"][i], data["height"][i]
-                if ww <= 0 or wh <= 0:
-                    continue
-                all_words.append({
-                    "text": text,
-                    "conf": conf,
-                    "left": x0 + data["left"][i],
-                    "top": y0 + data["top"][i],
-                    "width": ww,
-                    "height": wh,
-                })
+    for tiles in tile_sets:
+        for (x0, y0, x1, y1) in tiles:
+            crop = image_bgr[y0:y1, x0:x1]
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            for config in TESS_CONFIGS:
+                data = pytesseract.image_to_data(gray, lang=lang, config=config, output_type=Output.DICT)
+                for i in range(len(data["text"])):
+                    text = data["text"][i]
+                    conf = float(data["conf"][i])
+                    if not text.strip() or conf < min_conf:
+                        continue
+                    ww, wh = data["width"][i], data["height"][i]
+                    if ww <= 0 or wh <= 0:
+                        continue
+                    all_words.append({
+                        "text": text,
+                        "conf": conf,
+                        "left": x0 + data["left"][i],
+                        "top": y0 + data["top"][i],
+                        "width": ww,
+                        "height": wh,
+                    })
 
     words = dedup_words(all_words)
     words = [w for w in words if looks_like_real_word(w["text"], w["conf"])]
