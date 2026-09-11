@@ -475,7 +475,7 @@ def harmonize_column_headers(records, img_w, width_ratio_thresh=0.6, title_width
             continue
         groups.setdefault(find(i), []).append(i)
 
-        for idxs in groups.values():
+    for idxs in groups.values():
         if len(idxs) < 2:
             continue
         # anggap paragraf terlebar di grup ini sebagai body-text acuan
