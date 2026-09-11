@@ -431,15 +431,13 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     }
     return record, combined_mask
 
-def harmonize_column_headers(records, width_ratio_thresh=0.6):
+def harmonize_column_headers(records, img_w, width_ratio_thresh=0.6, title_width_ratio=0.4):
     """
-    Header pendek 1-baris yang duduk di atas body-text di kolom yang
-    sama sering ke-render lebih sempit dari lebar sebenarnya (box-nya
-    pas banget cuma sesuai lebar teksnya sendiri), padahal biasanya
-    header itu center di dalam kolom yang sama lebarnya dengan body
-    text di bawahnya. Kita kelompokkan paragraf jadi 'kolom' (lewat
-    overlap horizontal), lalu lebarkan + center-kan header yang jauh
-    lebih sempit dari body-text di kolom yang sama.
+    (penjelasan sama seperti sebelumnya)
+    Elemen yang lebarnya > 40% lebar gambar dianggap judul/elemen
+    full-width (bukan bagian dari 1 kolom card), jadi di-exclude total
+    dari proses union supaya nggak "menjembatani" 2 kolom berbeda
+    jadi 1 grup yang salah.
     """
     n = len(records)
     parent = list(range(n))
@@ -455,8 +453,14 @@ def harmonize_column_headers(records, width_ratio_thresh=0.6):
         if rx != ry:
             parent[ry] = rx
 
+    is_title_like = [r["width"] > img_w * title_width_ratio for r in records]
+
     for i in range(n):
+        if is_title_like[i]:
+            continue
         for j in range(i + 1, n):
+            if is_title_like[j]:
+                continue
             a, b = records[i], records[j]
             a_l, a_r = a["left"], a["left"] + a["width"]
             b_l, b_r = b["left"], b["left"] + b["width"]
@@ -467,6 +471,8 @@ def harmonize_column_headers(records, width_ratio_thresh=0.6):
 
     groups = {}
     for i in range(n):
+        if is_title_like[i]:
+            continue
         groups.setdefault(find(i), []).append(i)
 
     for idxs in groups.values():
@@ -632,8 +638,8 @@ if __name__ == "__main__":
         records.append(record)
         full_mask = cv2.bitwise_or(full_mask, mask)
 
-    records = harmonize_column_headers(records)
-
+    records = harmonize_column_headers(records, img_w)
+    
     clean_bg = inpaint_background(img, full_mask)
     bg_path = f"output/{name}_bg.jpg"
     cv2.imwrite(bg_path, clean_bg, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
