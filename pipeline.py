@@ -629,7 +629,15 @@ def render_html(img_w, img_h, bg_src, paragraphs, title="Slide"):
 
 def process_slide(image_path, out_dir="output"):
     """Proses 1 gambar slide end-to-end: OCR -> clustering -> style ->
-    inpainting -> HTML. Return dict berisi path file yang dihasilkan."""
+    inpainting -> HTML. Return dict berisi path file yang dihasilkan.
+
+    KNOWN LIMITATION: pada background yang sangat ramai (banyak elemen
+    grafis + garis), Tesseract kadang gagal total mendeteksi 1-2 kata
+    pendek meski di-crop terisolasi teksnya jelas terbaca (lihat kasus
+    kata "Services" di slide4). Percobaan menambah pass tiling kedua
+    yang lebih granular terbukti menimbulkan regresi (duplikat teks di
+    slide lain) sehingga tidak dipakai -- trade-off yang diambil.
+    """
     os.makedirs(out_dir, exist_ok=True)
     name = os.path.splitext(os.path.basename(image_path))[0]
 
