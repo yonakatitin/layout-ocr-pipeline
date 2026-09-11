@@ -478,19 +478,22 @@ def harmonize_column_headers(records, img_w, width_ratio_thresh=0.6, title_width
     for idxs in groups.values():
         if len(idxs) < 2:
             continue
-        # anggap paragraf terlebar di grup ini sebagai body-text acuan
-        # (biasanya multi-baris & center-aligned, jadi titik tengahnya akurat)
-        widest = max(idxs, key=lambda i: records[i]["width"])
-        ref = records[widest]
+        # pilih body-text (multi-baris) sebagai acuan titik tengah kalau
+        # ada; kalau semua 1-baris, pakai yang paling lebar sebagai acuan
+        multiline_idxs = [i for i in idxs if "\n" in records[i]["text"]]
+        ref_idx = (
+            max(multiline_idxs, key=lambda i: records[i]["width"])
+            if multiline_idxs
+            else max(idxs, key=lambda i: records[i]["width"])
+        )
+        ref = records[ref_idx]
         ref_center = ref["left"] + ref["width"] / 2.0
 
         for i in idxs:
-            r = records[i]
-            if i == widest:
+            if i == ref_idx:
                 continue
-            if "\n" not in r["text"] and r["width"] < ref["width"] * width_ratio_thresh:
-                # geser box header supaya SE-TITIK-TENGAH sama body-text,
-                # tanpa mengubah lebar box header itu sendiri
+            r = records[i]
+            if "\n" not in r["text"]:
                 r["left"] = ref_center - r["width"] / 2.0
     return records
 
