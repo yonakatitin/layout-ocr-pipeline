@@ -363,6 +363,13 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     """
     Hitung bounding box gabungan + style (warna, ukuran font, alignment,
     dst) untuk 1 paragraf (list of lines), sekaligus kumpulin glyph mask.
+
+    KNOWN LIMITATION: posisi & lebar box diestimasi murni dari bounding
+    box kata hasil OCR, bukan dari elemen desain asli (card/kolom).
+    Pada body-text yang wrap ke banyak baris secara tidak simetris,
+    titik tengah hasil estimasi bisa meleset beberapa px dari desain
+    aslinya -- terlihat pada header 1-baris yang di-recenter mengikuti
+    body-text di bawahnya (lihat harmonize_column_headers).
     """
     line_texts = []
     line_lefts, line_rights = [], []
@@ -620,15 +627,15 @@ def render_html(img_w, img_h, bg_src, paragraphs, title="Slide"):
         bg_src=bg_src, text_nodes="\n    ".join(nodes),
     )
 
-# ============================================================
-# 6. DRIVER
-# ============================================================
+def process_slide(image_path, out_dir="output"):
+    """Proses 1 gambar slide end-to-end: OCR -> clustering -> style ->
+    inpainting -> HTML. Return dict berisi path file yang dihasilkan."""
+    os.makedirs(out_dir, exist_ok=True)
+    name = os.path.splitext(os.path.basename(image_path))[0]
 
-if __name__ == "__main__":
-    os.makedirs("output", exist_ok=True)
-
-    name = "slide3"
-    img = cv2.imread(f"images/{name}.jpg")
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(image_path)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     img_h, img_w = img.shape[:2]
 
@@ -645,14 +652,33 @@ if __name__ == "__main__":
         full_mask = cv2.bitwise_or(full_mask, mask)
 
     records = harmonize_column_headers(records, img_w)
-    
+
     clean_bg = inpaint_background(img, full_mask)
-    bg_path = f"output/{name}_bg.jpg"
+    bg_path = os.path.join(out_dir, f"{name}_bg.jpg")
     cv2.imwrite(bg_path, clean_bg, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
 
     html_str = render_html(img_w, img_h, f"{name}_bg.jpg", records, title=name)
-    html_path = f"output/{name}.html"
+    html_path = os.path.join(out_dir, f"{name}.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html_str)
 
-    print(f"Selesai! Buka {html_path} di browser.")
+    return {"html": html_path, "background": bg_path, "n_paragraphs": len(records)}
+
+
+def process_folder(folder="images", out_dir="output", pattern="slide*.jpg"):
+    """Proses semua slide di 1 folder sekaligus."""
+    import glob
+    results = {}
+    for path in sorted(glob.glob(os.path.join(folder, pattern))):
+        print(f"Memproses {path} ...")
+        res = process_slide(path, out_dir=out_dir)
+        results[path] = res
+        print(f"  -> {res['n_paragraphs']} blok teks -> {res['html']}")
+    return results
+
+# ============================================================
+# 6. DRIVER
+# ============================================================
+
+if __name__ == "__main__":
+    process_folder("images", "output")
