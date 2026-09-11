@@ -4,12 +4,16 @@ import pytesseract
 from pytesseract import Output
 import os
 import html as htmllib
+import numpy as np
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # ============================================================
 # LAYOUT-AWARE TEXT EXTRACTION PIPELINE
-# End-to-end: OCR -> clustering -> style detection -> inpainting -> HTML
+# Ekstrak teks dari gambar slide (bounding box + style) dan render
+# ulang sebagai overlay HTML editable di atas background.
+# Alur: tiled OCR -> layout clustering -> style estimation ->
+#       inpainting -> HTML generation
 # ============================================================
 
 TESS_LANG = "ind+eng"
@@ -17,16 +21,24 @@ TESS_CONFIGS = ["--psm 3", "--psm 11"]
 
 # ============================================================
 # 1. TILED OCR EXTRACTION
-# Potong gambar jadi tile overlap, OCR tiap tile (psm3+psm11),
-# gabung + dedup + filter noise.
 # ============================================================
+# OCR langsung di gambar full-resolution sering gagal mendeteksi teks
+# besar berkontras rendah karena page-segmentation Tesseract keganggu
+# oleh elemen visual lain di sekitarnya. Gambar dipecah jadi grid tile
+# yang saling overlap, di-OCR per tile (2 psm mode), lalu hasil
+# digabung dan dibersihkan dari duplikat/noise.
 
 def make_tiles(img_w, img_h, target_tile_px=3200, overlap=0.35):
     """
-    Bikin grid tile yang saling overlap.
-    - target_tile_px: ukuran ideal 1 sisi tile (pixel)
-    - overlap: seberapa besar tile bertumpuk (0.25 = 25%)
-    Minimal grid 2x2 (1 pass OCR full-image gampang miss teks kontras rendah).
+    Bangun grid tile overlap untuk 1 gambar.
+
+    target_tile_px : target ukuran 1 sisi tile dalam pixel
+    overlap         : rasio tumpang-tindih antar tile (0.35 = 35%)
+
+    Grid minimal 2x2 -- OCR 1-pass di gambar utuh cenderung miss teks
+    besar berkontras rendah pada background gradient/ramai.
+    Overlap perlu cukup lebar (>=0.3) supaya kata-kata lebar tidak
+    terpotong persis di garis batas tile.
     """
     n_cols = max(2, math.ceil(img_w / target_tile_px))
     n_rows = max(2, math.ceil(img_h / target_tile_px))
@@ -45,7 +57,9 @@ def make_tiles(img_w, img_h, target_tile_px=3200, overlap=0.35):
             tiles.append((x, y, x1, y1))
     return tiles
 
+
 def iou(a, b):
+    """Intersection-over-Union antara 2 bounding box dict {left,top,width,height}."""
     ax0, ay0, ax1, ay1 = a["left"], a["top"], a["left"] + a["width"], a["top"] + a["height"]
     bx0, by0, bx1, by1 = b["left"], b["top"], b["left"] + b["width"], b["top"] + b["height"]
     ix0, iy0 = max(ax0, bx0), max(ay0, by0)
@@ -57,8 +71,9 @@ def iou(a, b):
     area_b = (bx1 - bx0) * (by1 - by0)
     return inter / (area_a + area_b - inter + 1e-6)
 
+
 def contained_ratio(a, b):
-    """Seberapa besar persentase box a yang 'ketelan' di dalam box b (0..1)."""
+    """Persentase area box a yang berada di dalam box b (0..1)."""
     ax0, ay0, ax1, ay1 = a["left"], a["top"], a["left"] + a["width"], a["top"] + a["height"]
     bx0, by0, bx1, by1 = b["left"], b["top"], b["left"] + b["width"], b["top"] + b["height"]
     ix0, iy0 = max(ax0, bx0), max(ay0, by0)
@@ -69,13 +84,23 @@ def contained_ratio(a, b):
     area_a = (ax1 - ax0) * (ay1 - ay0) or 1
     return inter / area_a
 
+
 def dedup_words(words, iou_thresh=0.4, containment_thresh=0.75):
     """
-    Buang duplikat 2 cara:
-    1. IoU tinggi -> box yang hampir sama persis (dari tile overlap)
-    2. Containment tinggi -> box kecil yang 'ketelan' di dalam box lain
-       yang lebih besar (fragmen/pecahan kata salah baca, biasanya
-       muncul dari psm11 yang lebih 'berani' nebak-nebak)
+    Hapus deteksi kata duplikat hasil overlap antar tile / antar psm mode.
+
+    Dua kriteria duplikat:
+    1. IoU tinggi        -> box hampir identik (deteksi yang sama dari
+                             tile berbeda).
+    2. Containment tinggi -> box kecil yang nyaris seluruhnya berada di
+                             dalam box lain yang lebih besar. Ini
+                             menangkap fragmen kata (mis. 1-2 huruf
+                             nyempil di dalam kata yang lebih panjang)
+                             yang lolos dari filter IoU karena selisih
+                             ukuran box-nya terlalu jauh.
+
+    Box dengan confidence lebih tinggi (lalu teks lebih panjang sebagai
+    tie-breaker) yang dipertahankan.
     """
     words = sorted(words, key=lambda w: (-w["conf"], -len(w["text"])))
     kept = []
@@ -92,8 +117,20 @@ def dedup_words(words, iou_thresh=0.4, containment_thresh=0.75):
             kept.append(w)
     return kept
 
+
 def ocr_words_tiled(image_bgr, lang=TESS_LANG, min_conf=45, target_tile_px=3200, overlap=0.35):
-    """OCR seluruh gambar lewat tiling (psm3 + psm11) + dedup + filter noise."""
+    """
+    OCR full pipeline per gambar: tiling -> OCR (psm3 + psm11 per tile)
+    -> dedup -> filter noise. Return list of dict kata dalam koordinat
+    gambar penuh.
+
+    psm3 (automatic page segmentation) dipakai sebagai mode utama karena
+    hasilnya lebih bersih, tapi kadang gagal total mendeteksi 1 blok
+    teks meski isinya jelas terbaca (khususnya pada crop yang didominasi
+    elemen grafis). psm11 (sparse text) dipakai sebagai fallback untuk
+    menangkap kasus tersebut, dengan konsekuensi noise lebih tinggi yang
+    ditangani lewat looks_like_real_word() dan filter_outliers().
+    """
     h, w = image_bgr.shape[:2]
     tiles = make_tiles(w, h, target_tile_px=target_tile_px, overlap=overlap)
 
@@ -125,17 +162,20 @@ def ocr_words_tiled(image_bgr, lang=TESS_LANG, min_conf=45, target_tile_px=3200,
     words = filter_outliers(words)
     return words
 
+
 def looks_like_real_word(text, conf, min_high_conf=85, min_low_conf=60):
     """
-    Filter buat buang noise OCR (biasanya dari ikon/ilustrasi yang
-    kebaca sebagai simbol/huruf random).
-    - Token pendek (<=2 karakter) sering salah baca ikon/garis grafis
-      dengan confidence lumayan tinggi (85-88) -> butuh threshold
-      lebih ketat (92) supaya nggak lolos, sementara kata pendek asli
-      ("PT", "di", "IT,") biasanya confidence-nya >=93.
-    - Token lebih panjang (>2 karakter) pakai threshold normal (85).
-    - Confidence sedang (>=60) -> harus terlihat kayak kata beneran
-      (minimal 4 karakter alfanumerik, bukan simbol doang).
+    Filter validitas token OCR untuk membuang noise dari elemen
+    grafis/ikon yang terbaca sebagai simbol/huruf random (umumnya
+    dari pass psm11).
+
+    - Token pendek (<=2 char) rawan salah-baca ikon/garis dengan
+      confidence tetap tinggi (85-88) -> pakai threshold lebih ketat
+      (92) untuk kategori ini, sementara kata pendek asli ("PT", "di")
+      biasanya confidence >=93.
+    - Token >2 char pakai threshold normal (85).
+    - Confidence sedang (>=60) tetap bisa lolos kalau token cukup
+      panjang dan mayoritas alfanumerik (>=4 char, rasio alnum >0.6).
     """
     t = text.strip()
     if not t:
@@ -151,11 +191,12 @@ def looks_like_real_word(text, conf, min_high_conf=85, min_low_conf=60):
 
 def filter_outliers(words, max_height_ratio=3.2, short_symbol_max_h=260):
     """
-    Buang deteksi yang jelas aneh:
-    - token pendek (<=2 char) tanpa huruf/angka tapi bounding box-nya
-      raksasa (biasanya salah baca elemen grafis/ikon)
-    - token pendek yang tinggi bounding box-nya jauh di atas rata-rata
-      tinggi teks lain di gambar (outlier ukuran)
+    Buang 2 kategori deteksi outlier yang lolos dari looks_like_real_word:
+    - token pendek non-alfanumerik (simbol/tanda baca lepas) dengan
+      bounding box tidak wajar besar -- umumnya salah baca elemen
+      dekoratif (panah, garis, ikon).
+    - token pendek (<=3 char) dengan tinggi jauh di atas tinggi median
+      teks lain di gambar yang sama.
     """
     if not words:
         return words
@@ -173,21 +214,29 @@ def filter_outliers(words, max_height_ratio=3.2, short_symbol_max_h=260):
         cleaned.append(w)
     return cleaned
 
-import numpy as np
 
 # ============================================================
 # 2. LAYOUT CLUSTERING
-# Kata -> baris -> paragraf, pakai union-find biar robust untuk
-# layout multi-kolom (card bersebelahan, hexagon, dll).
 # ============================================================
+# OCR per-tile menghasilkan bounding box per kata tanpa struktur
+# baris/paragraf yang konsisten (id block/par/line dari Tesseract tidak
+# valid lintas tile). Struktur baris dan paragraf dibangun ulang murni
+# dari geometri bounding box, pakai union-find supaya robust terhadap
+# layout multi-kolom (card sejajar, hexagon, dll) -- pendekatan
+# "row-dulu-baru-kolom" yang lebih sederhana rentan salah gabung baris
+# dari kolom berbeda yang kebetulan sejajar secara vertikal.
 
 def cluster_lines(words, v_tol_factor=0.45, h_gap_factor=2.0):
     """
-    Gabungkan kata jadi baris pakai union-find: 2 kata dianggap 1 baris
-    HANYA KALAU deket secara vertikal (center Y mirip) DAN deket secara
-    horizontal (gap kecil) sekaligus. Ini lebih robust dibanding pisah
-    row-dulu-baru-kolom, karena nggak ada 'drift' dari average yang
-    terus membesar.
+    Kelompokkan kata jadi baris. Dua kata masuk baris yang sama hanya
+    jika berdekatan secara vertikal (selisih center-Y < v_tol_factor *
+    tinggi rata-rata) DAN horizontal (gap < h_gap_factor * tinggi
+    rata-rata) sekaligus.
+
+    Union-find dipakai alih-alih pengelompokan bertahap (row lalu split
+    kolom) karena pendekatan bertahap rentan "drift": bounding box grup
+    yang terus membesar bisa menjembatani kata-kata yang sebenarnya beda
+    baris/kolom.
     """
     n = len(words)
     if n == 0:
@@ -240,10 +289,17 @@ def cluster_lines(words, v_tol_factor=0.45, h_gap_factor=2.0):
 
 def cluster_paragraphs(lines, gap_factor=0.7, min_x_overlap=0.35, max_height_ratio=1.7):
     """
-    Gabungkan baris jadi paragraf pakai union-find (bukan cuma cek baris
-    yang bersebelahan di list, karena urutan list bisa interleaved antar
-    kolom). Syarat gabung: jarak vertikal kecil + overlap horizontal +
-    ukuran font mirip (biar judul besar ga ke-gabung sama body text kecil).
+    Kelompokkan baris jadi paragraf lewat union-find atas SEMUA pasangan
+    baris (bukan hanya baris yang bersebelahan di list terurut -- urutan
+    top-to-bottom bisa interleaved antar kolom pada layout multi-card).
+
+    Dua baris digabung jadi 1 paragraf jika:
+    - jarak vertikal kecil relatif terhadap tinggi baris (gap_factor)
+    - overlap horizontal signifikan (min_x_overlap) -- mencegah baris
+      dari kolom/card berbeda pada ketinggian yang sama ikut tergabung
+    - tinggi teks mirip (max_height_ratio) -- mencegah judul besar
+      tergabung dengan body text kecil di bawahnya hanya karena posisi
+      berdekatan
     """
     if not lines:
         return []
@@ -295,12 +351,16 @@ def cluster_paragraphs(lines, gap_factor=0.7, min_x_overlap=0.35, max_height_rat
     paragraphs.sort(key=lambda p: (p[0]["top"], min(w["left"] for w in p[0]["words"])))
     return paragraphs
 
+
 def is_likely_logo(para_lines, max_word_count=1, max_chars=4):
     """
-    Deteksi paragraf yang kemungkinan besar logo/watermark, bukan
-    konten yang perlu diedit: 1 baris, 1 kata pendek (<=4 karakter).
-    Paragraf seperti ini kita biarin di background asli (nggak
-    di-inpaint, nggak dijadikan elemen teks HTML).
+    Heuristik deteksi paragraf logo/watermark: 1 baris, 1 kata, <=4
+    karakter. Paragraf yang cocok kriteria ini di-exclude dari daftar
+    teks yang diedit (tidak di-inpaint, tidak dijadikan elemen HTML) --
+    logo perusahaan biasanya bukan konten yang perlu diedit, dan
+    bounding box-nya sering ikut menangkap elemen ikon di sekitarnya
+    sehingga ukuran font hasil estimasi tidak akurat kalau dipaksa jadi
+    teks biasa.
     """
     if len(para_lines) > 1:
         return False
@@ -310,19 +370,22 @@ def is_likely_logo(para_lines, max_word_count=1, max_chars=4):
     text = " ".join(w["text"] for w in words).strip()
     return len(text) <= max_chars
 
+
 # ============================================================
 # 3. STYLE ESTIMATION
-# Pisahkan pixel teks dari background (Otsu), ambil warna dominan
-# + estimasi ukuran font per paragraf.
 # ============================================================
+# Untuk tiap paragraf, style (warna teks, ukuran font, bold/normal,
+# text-align) diestimasi dari pixel gambar asli di area bounding box-nya,
+# bukan dari metadata (yang memang tidak tersedia dari gambar raster).
 
 def glyph_mask_for_box(gray, left, top, w, h, pad=3):
     """
-    Ambil crop di sekitar 1 kata (+ sedikit padding), lalu pisahkan
-    pixel 'teks' dari 'background' pakai Otsu threshold.
-    Asumsi: pixel teks itu MINORITAS di dalam box (background lebih
-    dominan), jadi kalau hasil threshold malah mayoritas putih,
-    kita balik (invert).
+    Pisahkan pixel glyph (teks) dari pixel background dalam 1 bounding
+    box kata, pakai Otsu threshold pada crop grayscale (+ padding kecil).
+
+    Asumsi: pixel glyph adalah kelas minoritas dalam box (background
+    mengisi area lebih luas dari coretan huruf) -- kalau hasil threshold
+    justru mayoritas putih, polaritas dibalik.
     """
     H, W = gray.shape[:2]
     x0 = max(0, left - pad)
@@ -340,11 +403,15 @@ def glyph_mask_for_box(gray, left, top, w, h, pad=3):
 
 
 def estimate_word_color_and_mask(image_bgr, gray, word):
-    """Kembalikan (warna_bgr, mask_full_size) untuk 1 kata."""
+    """
+    Return (warna_bgr, mask_full_size) untuk 1 kata. Warna diambil dari
+    median nilai pixel BGR pada area glyph mask (bukan bounding box
+    utuh, supaya tidak tercampur warna background).
+    """
     H, W = gray.shape[:2]
     mask, x0, y0 = glyph_mask_for_box(gray, word["left"], word["top"], word["width"], word["height"])
     full_mask = np.zeros((H, W), dtype=np.uint8)
-    color = (30, 30, 30)  # default abu gelap kalau gagal
+    color = (30, 30, 30)  # fallback abu gelap kalau segmentasi gagal
     if mask is not None and mask.any():
         full_mask[y0:y0 + mask.shape[0], x0:x0 + mask.shape[1]] = mask
         ys, xs = np.where(mask > 0)
@@ -361,15 +428,33 @@ def bgr_to_hex(bgr):
 
 def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     """
-    Hitung bounding box gabungan + style (warna, ukuran font, alignment,
-    dst) untuk 1 paragraf (list of lines), sekaligus kumpulin glyph mask.
+    Hitung bounding box gabungan + style lengkap (warna, font-size,
+    line-height, font-weight, text-align) untuk 1 paragraf, sekaligus
+    mengumpulkan glyph mask gabungannya untuk tahap inpainting.
 
-    KNOWN LIMITATION: posisi & lebar box diestimasi murni dari bounding
+    Estimasi font-size pakai persentil-85 dari tinggi tiap kata (bukan
+    median polos) -- median rentan bias turun pada paragraf yang
+    kebetulan didominasi kata tanpa huruf turunan (g/j/y), yang secara
+    visual tingginya lebih pendek dari kata dengan huruf turunan.
+
+    Bold/normal ditentukan dari stroke density (rasio pixel glyph
+    terhadap luas bounding box): teks bold punya coretan lebih tebal
+    sehingga densitasnya lebih tinggi. Threshold 0.32 diambil dari gap
+    yang teramati antara body text (0.275-0.309) dan header/judul
+    (0.341+) di seluruh slide sample.
+
+    Text-align (center/left) dideteksi dari variasi titik-tengah tiap
+    baris relatif terhadap variasi posisi kiri tiap baris -- pada teks
+    center-aligned, titik tengah tiap baris jauh lebih konsisten
+    dibanding posisi kirinya.
+
+    KNOWN LIMITATION: posisi & lebar box adalah estimasi dari bounding
     box kata hasil OCR, bukan dari elemen desain asli (card/kolom).
-    Pada body-text yang wrap ke banyak baris secara tidak simetris,
-    titik tengah hasil estimasi bisa meleset beberapa px dari desain
-    aslinya -- terlihat pada header 1-baris yang di-recenter mengikuti
-    body-text di bawahnya (lihat harmonize_column_headers).
+    Pada body-text yang wrap ke banyak baris secara tidak simetris
+    (baris terpanjang tidak merepresentasikan lebar kolom sebenarnya),
+    titik tengah hasil estimasi bisa meleset beberapa px -- berdampak
+    ke posisi header 1-baris yang di-recenter mengikuti body-text di
+    bawahnya (lihat harmonize_column_headers).
     """
     line_texts = []
     line_lefts, line_rights = [], []
@@ -410,10 +495,7 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
 
     stroke_density = (sum(glyph_areas) / sum(box_areas)) if box_areas else 0.18
     font_weight = 700 if stroke_density > 0.32 else 400
-    
-    # deteksi alignment: kalau titik tengah tiap baris relatif konsisten
-    # (variasinya kecil dibanding variasi posisi kiri tiap baris),
-    # berarti teks itu center-aligned di desain aslinya.
+
     para_center = (left + right) / 2.0
     line_centers = [(l + r) / 2.0 for l, r in zip(line_lefts, line_rights)]
     if len(line_centers) > 1:
@@ -423,6 +505,8 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     else:
         text_align = "left"
 
+    # padding kecil supaya teks tidak mepet/kepotong di tepi box saat
+    # dirender (font-size CSS lebih besar dari tinggi bbox mentah)
     pad_x = (right - left) * 0.06
     pad_y = (bottom - top) * 0.15
 
@@ -438,13 +522,27 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     }
     return record, combined_mask
 
+
 def harmonize_column_headers(records, img_w, width_ratio_thresh=0.6, title_width_ratio=0.4):
     """
-    (penjelasan sama seperti sebelumnya)
-    Elemen yang lebarnya > 40% lebar gambar dianggap judul/elemen
-    full-width (bukan bagian dari 1 kolom card), jadi di-exclude total
-    dari proses union supaya nggak "menjembatani" 2 kolom berbeda
-    jadi 1 grup yang salah.
+    Reposisi header 1-baris (mis. judul card) supaya titik-tengah
+    horizontalnya sejajar dengan body-text di kolom yang sama.
+
+    Header pendek 1-baris sering ter-render dengan box yang pas-pasan
+    mengikuti lebar teksnya sendiri, padahal secara desain biasanya
+    center di kolom yang sama lebarnya dengan body-text di bawahnya.
+    Paragraf dikelompokkan jadi "kolom" lewat overlap horizontal
+    (union-find), lalu tiap header 1-baris digeser (bukan di-stretch)
+    supaya titik tengahnya sama dengan body-text acuan di kolom yang
+    sama -- body-text multi-baris dipilih sebagai acuan kalau ada,
+    karena titik tengahnya lebih representatif untuk lebar kolom
+    sebenarnya dibanding paragraf 1-baris.
+
+    Elemen dengan lebar > title_width_ratio * lebar gambar (mis. judul
+    halaman) di-exclude total dari pengelompokan kolom -- kalau ikut
+    diproses, lebar elemen ini bisa menjembatani 2 kolom card yang
+    berbeda jadi 1 grup yang salah (overlap horizontal-nya besar karena
+    memang selebar halaman).
     """
     n = len(records)
     parent = list(range(n))
@@ -485,8 +583,6 @@ def harmonize_column_headers(records, img_w, width_ratio_thresh=0.6, title_width
     for idxs in groups.values():
         if len(idxs) < 2:
             continue
-        # pilih body-text (multi-baris) sebagai acuan titik tengah kalau
-        # ada; kalau semua 1-baris, pakai yang paling lebar sebagai acuan
         multiline_idxs = [i for i in idxs if "\n" in records[i]["text"]]
         ref_idx = (
             max(multiline_idxs, key=lambda i: records[i]["width"])
@@ -504,22 +600,35 @@ def harmonize_column_headers(records, img_w, width_ratio_thresh=0.6, title_width
                 r["left"] = ref_center - r["width"] / 2.0
     return records
 
+
 # ============================================================
 # 4. INPAINTING
-# Hapus teks asli dari background biar HTML overlay nggak dobel.
 # ============================================================
+# Glyph mask gabungan dari semua paragraf dipakai untuk menghapus teks
+# asli dari background, supaya elemen teks HTML yang di-overlay tidak
+# tampak dobel dengan sisa pixel teks asli di gambar.
 
 def inpaint_background(image_bgr, full_text_mask, dilate=15, radius=20):
-    """Hapus area teks (dari mask) di background pakai inpainting."""
+    """
+    Hapus area teks dari gambar background pakai cv2.inpaint (TELEA).
+
+    dilate dan radius perlu cukup besar (15/20) untuk hasil yang bersih
+    -- nilai default OpenCV (mis. dilate kecil, radius ~6) menyisakan
+    bayangan/artefak halus mengikuti bentuk huruf, terutama pada
+    background solid-color yang kontras dengan warna teks.
+    """
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate * 2 + 1, dilate * 2 + 1))
     mask = cv2.dilate(full_text_mask, kernel, iterations=1)
     return cv2.inpaint(image_bgr, mask, radius, cv2.INPAINT_TELEA)
 
+
 # ============================================================
 # 5. HTML GENERATION
-# Render paragraf jadi <div> contenteditable, posisi absolute,
-# di atas background hasil inpainting.
 # ============================================================
+# Tiap paragraf dirender sebagai <div contenteditable> yang diposisikan
+# absolute sesuai bounding box hasil ekstraksi, di atas background hasil
+# inpainting. Stage di-scale otomatis via JS (ResizeObserver) supaya
+# posisi tetap presisi di berbagai lebar viewport.
 
 STAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="id">
@@ -611,6 +720,7 @@ TEXT_NODE_TEMPLATE = (
 
 
 def render_html(img_w, img_h, bg_src, paragraphs, title="Slide"):
+    """Susun 1 file HTML lengkap dari list of paragraph record."""
     nodes = []
     for p in paragraphs:
         text = htmllib.escape(p["text"]).replace("\n", "<br>")
@@ -627,16 +737,20 @@ def render_html(img_w, img_h, bg_src, paragraphs, title="Slide"):
         bg_src=bg_src, text_nodes="\n    ".join(nodes),
     )
 
+
 def process_slide(image_path, out_dir="output"):
-    """Proses 1 gambar slide end-to-end: OCR -> clustering -> style ->
-    inpainting -> HTML. Return dict berisi path file yang dihasilkan.
+    """
+    Proses 1 gambar slide end-to-end: OCR -> clustering -> style ->
+    inpainting -> HTML. Return dict path file yang dihasilkan.
 
     KNOWN LIMITATION: pada background yang sangat ramai (banyak elemen
-    grafis + garis), Tesseract kadang gagal total mendeteksi 1-2 kata
-    pendek meski di-crop terisolasi teksnya jelas terbaca (lihat kasus
-    kata "Services" di slide4). Percobaan menambah pass tiling kedua
-    yang lebih granular terbukti menimbulkan regresi (duplikat teks di
-    slide lain) sehingga tidak dipakai -- trade-off yang diambil.
+    grafis/garis), Tesseract kadang gagal total mendeteksi 1-2 kata
+    pendek meski secara isolasi (crop kecil) teksnya jelas terbaca --
+    lihat kasus kata "Services" di slide4. Sudah dicoba menambah pass
+    tiling kedua yang lebih granular untuk menangkap kasus ini, tapi
+    hasilnya menimbulkan regresi (duplikasi teks) di slide lain, jadi
+    pendekatan itu di-revert. Trade-off yang diambil: robust di
+    mayoritas kasus lebih diprioritaskan daripada coverage 100%.
     """
     os.makedirs(out_dir, exist_ok=True)
     name = os.path.splitext(os.path.basename(image_path))[0]
@@ -674,7 +788,7 @@ def process_slide(image_path, out_dir="output"):
 
 
 def process_folder(folder="images", out_dir="output", pattern="slide*.jpg"):
-    """Proses semua slide di 1 folder sekaligus."""
+    """Jalankan process_slide untuk semua file yang cocok pattern di 1 folder."""
     import glob
     results = {}
     for path in sorted(glob.glob(os.path.join(folder, pattern))):
@@ -683,6 +797,7 @@ def process_folder(folder="images", out_dir="output", pattern="slide*.jpg"):
         results[path] = res
         print(f"  -> {res['n_paragraphs']} blok teks -> {res['html']}")
     return results
+
 
 # ============================================================
 # 6. DRIVER
