@@ -361,11 +361,11 @@ def bgr_to_hex(bgr):
 
 def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     """
-    Hitung bounding box gabungan + style (warna, ukuran font, dst)
-    untuk 1 paragraf (list of lines), sekaligus kumpulin glyph mask-nya
-    (nanti dipakai buat inpainting di langkah berikutnya).
+    Hitung bounding box gabungan + style (warna, ukuran font, alignment,
+    dst) untuk 1 paragraf (list of lines), sekaligus kumpulin glyph mask.
     """
     line_texts = []
+    line_lefts, line_rights = [], []
     all_colors, all_heights = [], []
     glyph_areas, box_areas = [], []
     combined_mask = np.zeros(gray.shape[:2], dtype=np.uint8)
@@ -373,6 +373,8 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     for line in para_lines:
         words = line["words"]
         line_texts.append(" ".join(w["text"] for w in words))
+        line_lefts.append(min(w["left"] for w in words))
+        line_rights.append(max(w["left"] + w["width"] for w in words))
         for w in words:
             color, mask = estimate_word_color_and_mask(image_bgr, gray, w)
             all_colors.append(color)
@@ -388,7 +390,7 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     bottom = max(w["top"] + w["height"] for w in all_words)
 
     median_h = float(np.median(all_heights)) if all_heights else 20.0
-    font_size_px = median_h * 0.92  # dikit di bawah tinggi bbox asli, biar muat
+    font_size_px = median_h * 0.92
 
     if len(para_lines) > 1:
         tops = [line["top"] for line in para_lines]
@@ -402,6 +404,18 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     stroke_density = (sum(glyph_areas) / sum(box_areas)) if box_areas else 0.18
     font_weight = 700 if stroke_density > 0.30 else 400
 
+    # deteksi alignment: kalau titik tengah tiap baris relatif konsisten
+    # (variasinya kecil dibanding variasi posisi kiri tiap baris),
+    # berarti teks itu center-aligned di desain aslinya.
+    para_center = (left + right) / 2.0
+    line_centers = [(l + r) / 2.0 for l, r in zip(line_lefts, line_rights)]
+    if len(line_centers) > 1:
+        center_dev = float(np.std([c - para_center for c in line_centers]))
+        left_dev = float(np.std([l - left for l in line_lefts]))
+        text_align = "center" if center_dev < left_dev * 0.6 else "left"
+    else:
+        text_align = "left"
+
     pad_x = (right - left) * 0.06
     pad_y = (bottom - top) * 0.15
 
@@ -413,6 +427,7 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
         "line_height_px": round(line_height_px, 1),
         "color": bgr_to_hex(color_bgr),
         "font_weight": font_weight,
+        "text_align": text_align,
     }
     return record, combined_mask
 
@@ -518,13 +533,11 @@ TEXT_NODE_TEMPLATE = (
     '<div class="text-el" contenteditable="true" spellcheck="false" '
     'style="left:{left}px; top:{top}px; width:{width}px; height:{height}px; '
     'font-size:{font_size}px; line-height:{line_height}px; color:{color}; '
-    'font-weight:{font_weight};">{text}</div>'
+    'font-weight:{font_weight}; text-align:{text_align};">{text}</div>'
 )
 
 
 def render_html(img_w, img_h, bg_src, paragraphs, title="Slide"):
-    """Susun semua paragraf jadi <div> yang diposisikan absolute, lalu
-    bungkus dalam template stage yang responsive (auto-scale via JS)."""
     nodes = []
     for p in paragraphs:
         text = htmllib.escape(p["text"]).replace("\n", "<br>")
@@ -532,7 +545,8 @@ def render_html(img_w, img_h, bg_src, paragraphs, title="Slide"):
             TEXT_NODE_TEMPLATE.format(
                 left=p["left"], top=p["top"], width=p["width"], height=p["height"],
                 font_size=p["font_size_px"], line_height=p["line_height_px"],
-                color=p["color"], font_weight=p["font_weight"], text=text,
+                color=p["color"], font_weight=p["font_weight"],
+                text_align=p["text_align"], text=text,
             )
         )
     return STAGE_TEMPLATE.format(
