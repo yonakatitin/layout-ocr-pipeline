@@ -389,7 +389,7 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     right = max(w["left"] + w["width"] for w in all_words)
     bottom = max(w["top"] + w["height"] for w in all_words)
 
-    median_h = float(np.median(all_heights)) if all_heights else 20.0
+    median_h = float(np.percentile(all_heights, 85)) if all_heights else 20.0
     font_size_px = median_h * 0.92
 
     if len(para_lines) > 1:
@@ -430,6 +430,60 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
         "text_align": text_align,
     }
     return record, combined_mask
+
+def harmonize_column_headers(records, width_ratio_thresh=0.6):
+    """
+    Header pendek 1-baris yang duduk di atas body-text di kolom yang
+    sama sering ke-render lebih sempit dari lebar sebenarnya (box-nya
+    pas banget cuma sesuai lebar teksnya sendiri), padahal biasanya
+    header itu center di dalam kolom yang sama lebarnya dengan body
+    text di bawahnya. Kita kelompokkan paragraf jadi 'kolom' (lewat
+    overlap horizontal), lalu lebarkan + center-kan header yang jauh
+    lebih sempit dari body-text di kolom yang sama.
+    """
+    n = len(records)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[ry] = rx
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = records[i], records[j]
+            a_l, a_r = a["left"], a["left"] + a["width"]
+            b_l, b_r = b["left"], b["left"] + b["width"]
+            overlap = max(0, min(a_r, b_r) - max(a_l, b_l))
+            min_w = min(a_r - a_l, b_r - b_l) or 1
+            if overlap / min_w > 0.4:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    for idxs in groups.values():
+        if len(idxs) < 2:
+            continue
+        widest = max(idxs, key=lambda i: records[i]["width"])
+        col_left = records[widest]["left"]
+        col_width = records[widest]["width"]
+        for i in idxs:
+            r = records[i]
+            if i == widest:
+                continue
+            if "\n" not in r["text"] and r["width"] < col_width * width_ratio_thresh:
+                r["left"] = col_left
+                r["width"] = col_width
+                r["text_align"] = "center"
+    return records
 
 # ============================================================
 # 4. INPAINTING
@@ -577,6 +631,8 @@ if __name__ == "__main__":
         record, mask = build_paragraph_record(img, gray, p, img_w, img_h)
         records.append(record)
         full_mask = cv2.bitwise_or(full_mask, mask)
+
+    records = harmonize_column_headers(records)
 
     clean_bg = inpaint_background(img, full_mask)
     bg_path = f"output/{name}_bg.jpg"
