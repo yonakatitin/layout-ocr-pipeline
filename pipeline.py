@@ -409,8 +409,8 @@ def build_paragraph_record(image_bgr, gray, para_lines, img_w, img_h):
     color_bgr = tuple(int(c) for c in np.median(np.array(all_colors), axis=0)) if all_colors else (30, 30, 30)
 
     stroke_density = (sum(glyph_areas) / sum(box_areas)) if box_areas else 0.18
-    font_weight = 700 if stroke_density > 0.35 else 400
-
+    font_weight = 700 if stroke_density > 0.32 else 400
+    
     # deteksi alignment: kalau titik tengah tiap baris relatif konsisten
     # (variasinya kecil dibanding variasi posisi kiri tiap baris),
     # berarti teks itu center-aligned di desain aslinya.
